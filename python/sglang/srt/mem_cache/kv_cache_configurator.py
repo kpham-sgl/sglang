@@ -1479,10 +1479,12 @@ class KVCacheConfigurator:
         untranslated) needs the two page sizes to agree, or that final page's tail
         addresses rows that do not exist.
 
-        Silent, and only at near-full occupancy: Kimi-K3 8xB300, 2026-08-01, pool
-        page 64 vs allocator page 512 under DCP8 left 448 nonexistent rows per
-        request that reached the last page. The target escapes it by translating
-        (``loc // dcp_size`` scales the overshoot by the same factor).
+        Silent, and only reachable at near-full occupancy, which is why this
+        class of fault reads as stochastic: under an 8-way DCP group a 64-slot
+        pool page against a 512-slot allocator page leaves 448 nonexistent rows
+        for any request that reaches the last page. The target escapes it by
+        translating (``loc // dcp_size`` scales the overshoot by the same
+        factor).
         """
         if not self.is_draft_worker or token_to_kv_pool_allocator is None:
             return
