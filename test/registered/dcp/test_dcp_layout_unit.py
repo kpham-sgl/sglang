@@ -204,26 +204,29 @@ class TestGetDcpLens(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
-        loc_space_scale = KVCacheConfigurator.loc_space_scale.fget
-        pool_page_size = KVCacheConfigurator.pool_page_size.fget
+        # pool_page_size composes loc_space_scale, so the stand-in carries both
+        # real properties -- a SimpleNamespace only satisfies the leaf reads.
+        class _Configurator:
+            loc_space_scale = KVCacheConfigurator.loc_space_scale
+            pool_page_size = KVCacheConfigurator.pool_page_size
+
+            def __init__(self, *, is_draft_worker, allocator):
+                self.is_draft_worker = is_draft_worker
+                self.token_to_kv_pool_allocator = allocator
+
         # The widened allocator the target built (dcp_size=4): see the test above.
         widened = SimpleNamespace(page_size=physical_page_size * 4, size=4096)
-
-        draft = SimpleNamespace(
-            is_draft_worker=True, token_to_kv_pool_allocator=widened
-        )
-        target = SimpleNamespace(
-            is_draft_worker=False, token_to_kv_pool_allocator=widened
-        )
+        draft = _Configurator(is_draft_worker=True, allocator=widened)
+        target = _Configurator(is_draft_worker=False, allocator=widened)
 
         for attn_dcp_size in (4, 1):
             # attn_dcp_size=1 stands in for a draft-scoped "DCP is off" context:
             # the draft's pool shape must not move with it.
             with rc.get_parallel().override(attn_dcp_size=attn_dcp_size):
-                self.assertEqual(loc_space_scale(draft), 4)
-                self.assertEqual(pool_page_size(draft), widened.page_size)
-                self.assertEqual(loc_space_scale(target), 1)
-                self.assertEqual(pool_page_size(target), physical_page_size)
+                self.assertEqual(draft.loc_space_scale, 4)
+                self.assertEqual(draft.pool_page_size, widened.page_size)
+                self.assertEqual(target.loc_space_scale, 1)
+                self.assertEqual(target.pool_page_size, physical_page_size)
 
     def test_a_draft_without_a_shared_allocator_does_not_scale(self):
         """Negative branch: the scale is only defined once an allocator is in hand.
