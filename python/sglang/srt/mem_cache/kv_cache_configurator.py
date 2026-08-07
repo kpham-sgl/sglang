@@ -275,10 +275,16 @@ class KVCacheConfigurator:
     # 1. A replicated draft indexes the allocator's virtual locs raw, so its pools
     #    span and page that space; the sharded target translates and stays per-rank.
     # 2. A pool must page as its allocator does, or its last page falls short.
+    # 3. That shape is read off the allocator, not re-derived from dcp_size: the
+    #    target already built it widened, so this is the same number by
+    #    construction, needs no DCP read on the draft path, and follows an
+    #    allocator that widens differently (SWA / HiSparse do not).
     @property
     def loc_space_scale(self) -> int:
-        dcp_size = get_parallel().attn_dcp_size
-        return dcp_size if (self.is_draft_worker and dcp_size > 1) else 1
+        allocator = self.token_to_kv_pool_allocator
+        if not self.is_draft_worker or allocator is None:
+            return 1
+        return allocator.page_size // get_schedule().page_size
 
     @property
     def pool_page_size(self) -> int:

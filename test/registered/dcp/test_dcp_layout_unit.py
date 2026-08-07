@@ -188,6 +188,57 @@ class TestGetDcpLens(CustomTestCase):
         self.assertEqual(dcp4_allocator.page_size, 256)
         self.assertEqual(dcp4_allocator.num_pages, 16)
 
+    def test_draft_pool_shape_comes_from_its_allocator_not_from_dcp(self):
+        """A replicated draft pages as the allocator it was handed pages.
+
+        The target builds that allocator widened, so reading its shape gives the
+        same number as scaling by dcp_size -- but without a DCP read, so it stays
+        correct when the draft's own DCP view is neutralized.
+        """
+        physical_page_size = 64
+        override = rc.get_context().override_server_args(
+            page_size=physical_page_size,
+            disaggregation_mode="null",
+            enable_hisparse=False,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        loc_space_scale = KVCacheConfigurator.loc_space_scale.fget
+        pool_page_size = KVCacheConfigurator.pool_page_size.fget
+        # The widened allocator the target built (dcp_size=4): see the test above.
+        widened = SimpleNamespace(page_size=physical_page_size * 4, size=4096)
+
+        draft = SimpleNamespace(
+            is_draft_worker=True, token_to_kv_pool_allocator=widened
+        )
+        target = SimpleNamespace(
+            is_draft_worker=False, token_to_kv_pool_allocator=widened
+        )
+
+        for attn_dcp_size in (4, 1):
+            # attn_dcp_size=1 stands in for a draft-scoped "DCP is off" context:
+            # the draft's pool shape must not move with it.
+            with rc.get_parallel().override(attn_dcp_size=attn_dcp_size):
+                self.assertEqual(loc_space_scale(draft), 4)
+                self.assertEqual(pool_page_size(draft), widened.page_size)
+                self.assertEqual(loc_space_scale(target), 1)
+                self.assertEqual(pool_page_size(target), physical_page_size)
+
+    def test_a_draft_without_a_shared_allocator_does_not_scale(self):
+        """Negative branch: the scale is only defined once an allocator is in hand.
+
+        loc_space_scale runs during _derive_pool_sizes, before
+        _build_token_to_kv_pool_allocator -- so the field is None for any worker
+        that builds its own. Dropping the guard turns that into an AttributeError
+        during pool sizing, which no other case here covers.
+        """
+        override = rc.get_context().override_server_args(page_size=64)
+        override.install()
+        self.addCleanup(override.restore)
+        stub = SimpleNamespace(is_draft_worker=True, token_to_kv_pool_allocator=None)
+        self.assertEqual(KVCacheConfigurator.loc_space_scale.fget(stub), 1)
+
     def test_live_cell_and_page_ownership_formulas(self):
         dcp_size = 4
         physical_page_size = 64
