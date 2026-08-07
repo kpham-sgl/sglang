@@ -438,6 +438,11 @@ class KVCacheConfigurator:
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
 
+        self._assert_draft_pool_pages_as_its_allocator(
+            token_to_kv_pool=token_to_kv_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+
         # Defensive check: the explicit validation above should reject known
         # unsupported pool families before allocation. Keep this guard here so
         # future pool-selection refactors fail at boot instead of on first use.
@@ -1458,6 +1463,37 @@ class KVCacheConfigurator:
             **pool_kwargs,
         )
         return token_to_kv_pool
+
+    def _assert_draft_pool_pages_as_its_allocator(
+        self,
+        *,
+        token_to_kv_pool: KVCache,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    ) -> None:
+        """The allocator's last page must fit inside the pool that indexes it raw.
+
+        ``PagedTokenToKVPoolAllocator.clear()`` skips page 0, so the free list ends
+        at page ``num_pages``, whose base is exactly ``size`` -- it hands out slots
+        up to ``size + allocator.page_size``. A pool over-allocates only its own
+        ``page_size`` past ``size``, so a replicated draft (which indexes those locs
+        untranslated) needs the two page sizes to agree, or that final page's tail
+        addresses rows that do not exist.
+
+        Silent, and only at near-full occupancy: Kimi-K3 8xB300, 2026-08-01, pool
+        page 64 vs allocator page 512 under DCP8 left 448 nonexistent rows per
+        request that reached the last page. The target escapes it by translating
+        (``loc // dcp_size`` scales the overshoot by the same factor).
+        """
+        if not self.is_draft_worker or token_to_kv_pool_allocator is None:
+            return
+        pool_page_size = token_to_kv_pool.page_size
+        allocator_page_size = token_to_kv_pool_allocator.page_size
+        assert pool_page_size >= allocator_page_size, (
+            f"draft KV pool pages at {pool_page_size} but its allocator pages at "
+            f"{allocator_page_size}; the allocator's last page would reach "
+            f"{token_to_kv_pool_allocator.size + allocator_page_size} against a pool "
+            f"valid to {token_to_kv_pool.size + pool_page_size}"
+        )
 
     def _build_token_to_kv_pool_allocator(
         self,
