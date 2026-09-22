@@ -65,6 +65,9 @@ class SchedulerInvariantChecker:
     # The chunked-prefill request parked between chunks is in neither batch;
     # its uncached tokens must still be counted.
     get_chunked_req: Callable = field(default=lambda: None)
+    # PD decode: requests parked in the prealloc/transfer/waiting queues hold
+    # KV that is in no batch; count their uncached tokens too.
+    get_extra_reqs: Callable = field(default=lambda: [])
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -273,6 +276,7 @@ class SchedulerInvariantChecker:
         chunked_req = self.get_chunked_req()
         if chunked_req is not None:
             reqs.append(chunked_req)
+        reqs.extend(self.get_extra_reqs())
         for req in reqs:
             if id(req) in counted:
                 continue
