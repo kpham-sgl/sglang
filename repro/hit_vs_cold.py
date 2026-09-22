@@ -2,8 +2,8 @@
 import json, os, sys, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-LB = "http://127.0.0.1:8000"
-DECODE = "http://127.0.0.1:30200"
+LB = f"http://127.0.0.1:{os.environ.get('LB_PORT', '8000')}"
+DECODE = f"http://127.0.0.1:{os.environ.get('DECODE_PORT', '30200')}"
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 12
 OUT = sys.argv[2] if len(sys.argv) > 2 else "/scratch/repro-out/hit-vs-cold.json"
 GSM8K = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
