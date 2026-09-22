@@ -1,0 +1,13 @@
+# shared env for all repro scripts
+export HF_HOME=/cluster-storage/models HF_HUB_CACHE=/cluster-storage/models/hub
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+export MODEL=${MODEL:-openai/gpt-oss-120b}
+export DRAFT=${DRAFT:-lmsys/EAGLE3-gpt-oss-120b-bf16}
+export TP=${TP:-4}
+export PREFILL_GPUS=${PREFILL_GPUS:-0,1,2,3}
+export DECODE_GPUS=${DECODE_GPUS:-4,5,6,7}
+export PREFILL_PORT=30100 DECODE_PORT=30200 LB_PORT=8000 BOOTSTRAP_PORT=8998
+export TRANSFER=${TRANSFER:-nixl}
+export ATTN=${ATTN:-triton}
+export SGLANG_ENABLE_UNIFIED_RADIX_TREE=1
+export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
