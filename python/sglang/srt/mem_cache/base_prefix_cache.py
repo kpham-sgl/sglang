@@ -573,6 +573,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_swa(self) -> bool:
         return False
 
+    def uses_bigram_key(self) -> bool:
+        """Whether radix keys are EAGLE bigrams. A bigram key over ``n`` committed
+        tokens has ``n - 1`` entries, so its page-aligned insert boundary is
+        ``page_floor(n - 1)``: a whole page below ``page_floor(n)`` whenever
+        ``n`` is a page multiple. Callers that keep SWA alive "below the insert
+        boundary" must account for that."""
+        return False
+
     def swa_retain_floor(self, req) -> int | None:
         # A match lands on a state checkpoint rather than on the tail, so a cache
         # that pairs SWA with mamba/conv checkpoints has to keep the window behind
