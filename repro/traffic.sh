@@ -8,7 +8,7 @@ report() { echo "[$(date -u +%T)] $1 decode_alive=$(alive && echo yes || echo NO
 for s in $STEPS; do
   case $s in
     1) echo "[$(date -u +%T)] step1 multiturn kit + gsm8k100"
-       python3 - <<PY
+       HF_HUB_OFFLINE=0 python3 - <<PY
 from sglang.test.kits.cache_hit_kit import run_multiturn_cache_hit_test
 r = run_multiturn_cache_hit_test(base_url="http://127.0.0.1:$LB_PORT", model_path="$MODEL", num_clients=8, num_rounds=2, request_length=384, output_length=64, max_parallel=4)
 print("multiturn:", r["overall"])
