@@ -1208,6 +1208,16 @@ class UnifiedRadixCache(BasePrefixCache):
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
+        if len(new_indices) < page_aligned_len:
+            logger.warning(
+                f"[REPOINT SHORTFALL] rid={req.rid[:8]} fill={len(token_ids)} "
+                f"effective_cache_len={effective_cache_len} page_aligned_len={page_aligned_len} "
+                f"matched={len(new_indices)} insert_prefix_len={new_prefix_len} "
+                f"swa_evicted_seqlen={req.kv.swa_evicted_seqlen} "
+                f"cache_protected_len={req.kv.cache_protected_len} "
+                f"committed={req.kv.kv_committed_len} allocated={req.kv.kv_allocated_len} "
+                f"is_eagle={self.tree_core.is_eagle} last_node_is_root={new_last_node is self.tree_core.root_node}"
+            )
         assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
             f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
         )
