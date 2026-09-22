@@ -2378,8 +2378,18 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
             get_chunked_req=lambda: self.chunked_req,
+            get_extra_reqs=self._invariant_extra_reqs,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
+
+    def _invariant_extra_reqs(self):
+        if self.disaggregation_mode != DisaggregationMode.DECODE:
+            return []
+        reqs = list(self.waiting_queue)
+        for q in (self.disagg_decode_prealloc_queue, self.disagg_decode_transfer_queue):
+            if q is not None:
+                reqs.extend(d.req for d in q.queue)
+        return reqs
 
     def init_rank_consensus_checker(self) -> None:
         groups = []

@@ -2667,6 +2667,18 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                # REPRO: non-fatal so the run continues to the idle check.
+                try:
+                    self.invariant_checker.self_check_during_busy()
+                except AssertionError as e:
+                    n = getattr(self, "_busy_leak_logs", 0)
+                    if n < 30:
+                        self._busy_leak_logs = n + 1
+                        logger.error(
+                            f"[BUSY LEAK #{n}] forward_ct={self.forward_ct} {e}\n"
+                            f"{self.invariant_checker._page_census()}"
+                        )
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
@@ -2729,6 +2741,18 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                # REPRO: non-fatal so the run continues to the idle check.
+                try:
+                    self.invariant_checker.self_check_during_busy()
+                except AssertionError as e:
+                    n = getattr(self, "_busy_leak_logs", 0)
+                    if n < 30:
+                        self._busy_leak_logs = n + 1
+                        logger.error(
+                            f"[BUSY LEAK #{n}] forward_ct={self.forward_ct} {e}\n"
+                            f"{self.invariant_checker._page_census()}"
+                        )
 
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch
