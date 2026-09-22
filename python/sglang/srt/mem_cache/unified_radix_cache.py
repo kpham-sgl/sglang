@@ -1210,7 +1210,7 @@ class UnifiedRadixCache(BasePrefixCache):
         new_prefix_len = result.prefix_len
         if len(new_indices) < page_aligned_len:
             logger.warning(
-                f"[REPOINT SHORTFALL] rid={req.rid[:8]} fill={len(token_ids)} "
+                f"[REPOINT SHORTFALL] rid={str(req.rid)[:8]} fill={len(token_ids)} "
                 f"effective_cache_len={effective_cache_len} page_aligned_len={page_aligned_len} "
                 f"matched={len(new_indices)} insert_prefix_len={new_prefix_len} "
                 f"swa_evicted_seqlen={req.kv.swa_evicted_seqlen} "
