@@ -77,10 +77,10 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "with --disaggregation-transfer-backend fake"
                 )
             if cfg.speculative_algorithm not in (None, "DSPARK"):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {cfg.speculative_algorithm})"
+                logger.warning(
+                    "REPRO: --disaggregation-decode-enable-radix-cache with "
+                    f"--speculative-algorithm {cfg.speculative_algorithm} is "
+                    "rejected upstream; allowed here for the pool over-count repro."
                 )
 
             if resolved_view(server_args).enable_dp_attention:

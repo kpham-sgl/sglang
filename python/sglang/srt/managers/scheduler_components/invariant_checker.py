@@ -447,8 +447,50 @@ class SchedulerInvariantChecker:
                 msg,
             )
 
+    def _page_census(self) -> str:
+        """REPRO diagnostic: for each sub-allocator, which pages are free twice,
+        free AND tree-owned, or owned by nobody."""
+        try:
+            alloc = self.token_to_kv_pool_allocator
+            ps = alloc.page_size
+            subs = []
+            if getattr(alloc, "free_pages", None) is not None:
+                subs.append(("full", alloc, self.tree_cache.all_values_flatten()))
+            else:
+                full = getattr(alloc, "full_attn_allocator", None)
+                swa = getattr(alloc, "swa_attn_allocator", None)
+                if full is not None:
+                    subs.append(("full", full, self.tree_cache.all_values_flatten()))
+                if swa is not None:
+                    swa_vals = getattr(self.tree_cache, "all_swa_values_flatten", None)
+                    subs.append(("swa", swa, swa_vals() if swa_vals else None))
+            out = []
+            for name, sub, tree_vals in subs:
+                free = sub.get_all_free_pages()
+                if free is None:
+                    continue
+                free = free.cpu()
+                uniq, cnt = torch.unique(free, return_counts=True)
+                dup = uniq[cnt > 1].tolist()
+                line = f"[census {name}] free_pages={free.numel()} dup_in_free={dup}"
+                if tree_vals is not None:
+                    tree_pages = torch.unique(tree_vals.cpu() // ps)
+                    both = tree_pages[torch.isin(tree_pages, uniq)].tolist()
+                    nobody = None
+                    if hasattr(sub, "size"):
+                        expected = torch.arange(1, sub.size // ps + 1)
+                        nobody = expected[
+                            ~torch.isin(expected, uniq)
+                            & ~torch.isin(expected, tree_pages)
+                        ].tolist()
+                    line += f" tree_pages={tree_pages.numel()} free_and_tree={both} unowned={nobody}"
+                out.append(line)
+            return "\n".join(out)
+        except Exception as e:  # diagnostic only
+            return f"[census failed: {e!r}]"
+
     def _report_leak(self, pool_name: str, token_msg: str):
-        msg = f"{pool_name} memory leak detected! {token_msg}"
+        msg = f"{pool_name} memory leak detected! {token_msg}\n{self._page_census()}"
         raise_error_or_warn(
             self,
             envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
