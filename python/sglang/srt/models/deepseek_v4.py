@@ -4579,7 +4579,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                 continue
             if method.block_fp8_as_mxfp8:
                 # Small shapes and deterministic execution keep their pinned tactic.
-                method.mxfp8_prefill_autotune_min_tokens = 4096
+                method.mxfp8_prefill_autotune_min_tokens = (
+                    envs.SGLANG_OPT_DSV41_MXFP8_AUTOTUNE_MIN_TOKENS.get()
+                )
             weight = layer.weight
             scale = layer.weight_scale_inv_swizzled
             key = (
