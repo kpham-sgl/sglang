@@ -898,6 +898,8 @@ def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
         if backend.is_aiter():
             return Mxfp8DenseGemmBackend.GFX95_MXFP8_AITER
         return Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE
+    if backend.is_deep_gemm() and _is_cuda and get_platform().is_blackwell:
+        return Mxfp8DenseGemmBackend.DEEP_GEMM
     # Explicit CUTLASS / CuTe-DSL only: they leave the weight untouched and store
     # the swizzled scale separately, so the block layout stays readable by Triton.
     if not (backend.is_flashinfer_cutedsl() or backend.is_flashinfer_cutlass()):
@@ -922,6 +924,8 @@ def can_serve_block_fp8_as_mxfp8(
 
 def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
     """The MXFP8 linear for a block-fp8 weight served as MXFP8."""
+    if backend.is_deep_gemm():
+        return _deepgemm_w8a8_mxfp8_linear_with_fallback
     if backend.is_flashinfer_cutlass():
         return partial(
             flashinfer_mxfp8_blockscaled_linear, backend="cutlass", pin_tactic=True
