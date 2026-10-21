@@ -70,6 +70,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
+    prepare_deepgemm_mxfp8_input_path,
     prepare_xpu_block_scale_for_scaled_mm,
     requant_block_scale_ue8m0_for_deepgemm,
     resolve_block_fp8_mxfp8_backend,
@@ -971,6 +972,8 @@ class Fp8LinearMethod(LinearMethodBase):
         # the swizzled copy is stored separately.
         self._process_mxfp8_linear_weight_scale(layer, scale_u8=scale_u8)
         layer.block_fp8_mxfp8_ready = True
+        if getattr(layer, "prepare_deepgemm_mxfp8_input", False):
+            prepare_deepgemm_mxfp8_input_path(layer)
 
     def _process_mxfp8_linear_weight_scale(
         self, layer: Module, scale_u8: Optional[torch.Tensor] = None
