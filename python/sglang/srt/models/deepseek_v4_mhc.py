@@ -414,6 +414,9 @@ def combine(
     whatever the previous post left in ``state.input``."""
     shortcut = state.input
     if isinstance(shortcut, HcQuantized):
+        if quantized is None and isinstance(shortcut.swizzled, Mxfp8DeepGemmInput):
+            # A reader that only wants the rows (the late-layer tail's source KV).
+            return shortcut.rows
         assert quantized is not None
         quantized.append(shortcut.swizzled)
         return shortcut.rows
