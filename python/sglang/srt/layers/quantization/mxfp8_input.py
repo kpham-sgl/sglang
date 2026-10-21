@@ -16,6 +16,14 @@ class Mxfp8SwizzledInput(NamedTuple):
     scales: torch.Tensor
 
 
+class Mxfp8DeepGemmInput(NamedTuple):
+    """E4M3 activations [M, K] and UE8M0 scales packed four per int32, [M, K // 128]
+    MN-major with a TMA-aligned M stride: the input a DeepGEMM 1d1d MXFP8 GEMM takes."""
+
+    data: torch.Tensor
+    scales: torch.Tensor
+
+
 def accepts_mxfp8_swizzled_input(linear) -> bool:
     """Whether a linear can consume the explicit 128x4 producer contract."""
     qm = getattr(linear, "quant_method", None)

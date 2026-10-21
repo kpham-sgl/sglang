@@ -104,7 +104,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
-from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8DeepGemmInput,
+    Mxfp8SwizzledInput,
+)
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -1395,6 +1398,9 @@ class MQALayer(MqaAttentionBase):
             self.mega_cos_sin_cache = precompute_cos_sin_table(**self.rope_kwargs)
         self.mega_wo_a = None
         self.mega_wq_b_permuted = False
+        # Set by setup_fused_mxfp8_producers once weights are processed.
+        self.fused_mxfp8_wqkv_a = False
+        self.fused_mxfp8_wo_b = False
 
         self.use_fused_qk_norm_rope = _is_hip and _hip.use_fused_qk_norm_rope(self)
         # Static eligibility; token count and wo_b's output format are checked
@@ -1461,6 +1467,34 @@ class MQALayer(MqaAttentionBase):
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
 
+    def setup_fused_mxfp8_producers(self) -> None:
+        """SGLANG_OPT_DSV41_FUSED_MXFP8_PRODUCERS: wqkv_a takes Mega-mHC's MXFP8 rows
+        and wo_b the wo_a einsum's, both on DeepGEMM; each linear keeps FlashInfer for
+        inputs that arrive unquantized."""
+        if not (
+            envs.SGLANG_OPT_DSV41_FUSED_MXFP8_PRODUCERS.get()
+            and self.use_mega_attention
+            and self.mega_wo_a is not None
+        ):
+            return
+        from sglang.srt.layers.quantization.fp8_utils import (
+            prepare_deepgemm_mxfp8_input_path,
+        )
+
+        self.fused_mxfp8_wqkv_a = bool(
+            self.fuse_wqa_wkv
+            and self.accepts_mxfp8_swizzled_input()
+            and prepare_deepgemm_mxfp8_input_path(self.wqkv_a)
+        )
+        self.fused_mxfp8_wo_b = bool(
+            self.n_local_groups * self.o_lora_rank == self.wo_b.weight.shape[-1]
+            and prepare_deepgemm_mxfp8_input_path(self.wo_b)
+        )
+
+    def accepts_mxfp8_deepgemm_input(self) -> bool:
+        """Whether wqkv_a also takes an `Mxfp8DeepGemmInput`."""
+        return self.fused_mxfp8_wqkv_a
+
     def _wq_b_uses_flashinfer_mxfp8(self) -> bool:
         method = self.wq_b.quant_method
         backend = getattr(method, "mxfp8_dense_backend", None)
@@ -1512,6 +1546,35 @@ class MQALayer(MqaAttentionBase):
             cos_sin_cache=self.mega_cos_sin_cache,
         )
         groups = self.n_local_groups
+        rows = data.shape[0]
+        if (
+            self.fused_mxfp8_wo_b
+            and 0 < rows <= mhc.FUSED_MXFP8_PRODUCER_MAX_ROWS
+            and not get_forward().sp_active
+        ):
+            import deep_gemm
+
+            # The einsum's epilogue quantizes wo_b's input: E4M3 plus per-32 UE8M0
+            # scales packed MN-major, the layout DeepGEMM's 1d1d GEMM reads.
+            out = torch.empty(
+                (rows, groups, self.o_lora_rank),
+                dtype=torch.float8_e4m3fn,
+                device=data.device,
+            )
+            out_scale = torch.empty_strided(
+                (rows, groups * self.o_lora_rank // 128),
+                (1, deep_gemm.get_tma_aligned_size(rows, 4)),
+                dtype=torch.int32,
+                device=data.device,
+            )
+            deep_gemm.fp8_einsum(
+                "bhr,hdr->bhd",
+                (data[:, :groups], scale[:, :groups]),
+                self.mega_wo_a,
+                (out, out_scale),
+                recipe=(1, 1, 32),
+            )
+            return Mxfp8DeepGemmInput(out.view(rows, -1), out_scale)
         return _fp8_wo_a_einsum(
             data[:, :groups], scale[:, :groups], *self.mega_wo_a, recipe=(1, 1, 32)
         )
@@ -4877,6 +4940,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         for module in self.modules():
             if isinstance(module, MQALayer):
                 module.setup_mega_attention()
+                module.setup_fused_mxfp8_producers()
 
         if is_nextn:
             return

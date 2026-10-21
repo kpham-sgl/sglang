@@ -26,6 +26,7 @@ def mhc_mega_boundary(
     hc_eps,
     norm_eps,
     sinkhorn_iters,
+    emit_mxfp8: bool = False,
 ):
     """Update the residual, collapse with carried pre, and compute next stats.
 
@@ -33,6 +34,10 @@ def mhc_mega_boundary(
     produced from the updated residual. Preserve this DSv4.1 shifted ordering.
     Used by the opt-in SM10x prefill path. Before CUDA graph capture, warm up
     on the capture stream to initialize DeepGEMM's per-stream barriers.
+
+    With ``emit_mxfp8`` the kernel also writes the normalized rows as E4M3 with
+    per-32 UE8M0 scales, packed four per int32 in DeepGEMM's MN-major TMA-aligned
+    layout, returned as a fourth element ``(fp8, scales)``.
     """
     rows, hidden = x.shape
     hc = residual.shape[1]
@@ -41,6 +46,13 @@ def mhc_mega_boundary(
     next_pre = torch.empty((rows, hc, 1), device=x.device, dtype=torch.float32)
     next_post = torch.empty_like(next_pre)
     next_comb = torch.empty_like(comb)
+    y_fp8 = y_gemm_sf = None
+    if emit_mxfp8:
+        y_fp8 = torch.empty((rows, hidden), device=x.device, dtype=torch.float8_e4m3fn)
+        rows_aligned = (rows + 3) // 4 * 4
+        y_gemm_sf = torch.empty(
+            (hidden // 128, rows_aligned), device=x.device, dtype=torch.int32
+        ).mT[:rows]
     deep_gemm.mega_mhc(
         x=x,
         residual=residual,
@@ -64,5 +76,10 @@ def mhc_mega_boundary(
         new_post_mix=next_post,
         new_comb_res_mix=next_comb,
         y_bf16=normalized,
+        y_fp8=y_fp8,
+        y_gemm_sf=y_gemm_sf,
     )
-    return updated, normalized, (next_pre.squeeze(-1), next_post.squeeze(-1), next_comb)
+    stats = (next_pre.squeeze(-1), next_post.squeeze(-1), next_comb)
+    if emit_mxfp8:
+        return updated, normalized, stats, (y_fp8, y_gemm_sf)
+    return updated, normalized, stats
