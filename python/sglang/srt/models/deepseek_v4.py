@@ -1581,7 +1581,7 @@ class MQALayer(MqaAttentionBase):
             and get_platform().is_blackwell
             and q.dtype == self.q_norm.weight.dtype == torch.bfloat16
             and q.ndim == 2
-            and 0 < q.shape[0] <= 8
+            and 0 < q.shape[0] <= envs.SGLANG_OPT_DSV41_QNORM_MXFP8_MAX_ROWS.get()
             and q.shape[1] == 1280
             and q.stride(1) == 1
             and getattr(method, "mxfp8_dense_backend", None)
