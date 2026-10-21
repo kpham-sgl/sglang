@@ -4033,6 +4033,10 @@ class DeepseekV4Model(nn.Module):
                 if (
                     self.config.model_type == "deepseek_v41"
                     and self.config.vision_n_layers > 0
+                    and not (
+                        forward_batch.forward_mode.is_decode_or_idle()
+                        or forward_batch.forward_mode.is_target_verify()
+                    )
                 ):
                     hidden_states = torch.where(
                         (input_ids == self.config.image_token_id)[:, None, None],
@@ -4400,7 +4404,7 @@ class DeepseekV4Model(nn.Module):
             from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
             hidden_states = mhc_combine(
-                pre_hc_head.float(), last_pre, self.hc_mult, hidden_states.dtype
+                pre_hc_head, last_pre, self.hc_mult, hidden_states.dtype
             )
         else:
             hidden_states = self.hc_head(
