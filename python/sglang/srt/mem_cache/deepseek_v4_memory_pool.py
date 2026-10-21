@@ -34,13 +34,12 @@ from sglang.kernels.ops.kvcache.dsv4_c128_cleanup import (
 from sglang.kernels.ops.kvcache.dsv4_main_kv_store import NopeFp8RopeBf16Pack
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backend
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_exec, get_platform, get_spec
-from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
+from sglang.srt.utils import ceil_div, is_hip
 from sglang.srt.utils.common import get_cuda_graph_max_batch_size
 
 logger = logging.getLogger(__name__)
@@ -219,19 +218,22 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
         and torch.cuda.get_device_capability()[0] == 10
     )
     if _is_hip:
-        supported = (
-            is_gfx95_supported() and resolve_hip_flashmla_backend() == "aiter_sparse"
-        )
-        if mode == "auto" and not supported:
+        # The V4.1 layouts are token-interleaved on this branch (FlashMLA 2e5429f); the
+        # gfx950 AITER / gluon readers still address the page-split layout.
+        if mode == "auto":
             return KVLayout.V4, None
-        if not supported:
-            raise ValueError(
-                "V4.1 KV layouts on HIP require gfx950 with aiter_sparse attention"
-            )
-        return KVLayout.V41, option
+        raise ValueError(
+            "the token-interleaved V4.1 KV layouts have no HIP reader; "
+            "use SGLANG_DSV4_KV_LAYOUT=v4"
+        )
     if mode == "auto" and not is_sm100:
         return KVLayout.V4, None
     assert is_sm100, "the V4.1 KV cache layouts need an SM100 / SM103 GPU"
+    from sglang.kernels.ops.attention.dsv4 import flashmla_v41
+
+    # Every SM100 V4.1 attention read goes through flashmla_v41_ops: fail at pool
+    # creation, not at the first decode.
+    flashmla_v41.load()
     return KVLayout.V41, option
 
 
@@ -1696,7 +1698,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             f"c{ratio}:{self.compressed_kv_layout(ratio).value}"
             for ratio in sorted(set(self.compression_ratios) - {0})
         ]
-        return ",".join([self.kv_layout.value, *compressed])
+        layout = ",".join([self.kv_layout.value, *compressed])
+        # The V4.1 caches are token-interleaved on this branch: a peer that still
+        # writes the page-split pages must fail the handshake, not mix layouts.
+        return f"{layout};token-interleaved" if self.kv_layout.interleaved else layout
 
     def _make_indexer_pool(
         self,

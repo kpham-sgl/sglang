@@ -18,6 +18,7 @@ execute_process(
 set(FLASHMLA_V41_TORCH_LIBRARIES
     ${_TORCH_LIB_DIR}/libc10.so ${_TORCH_LIB_DIR}/libc10_cuda.so
     ${_TORCH_LIB_DIR}/libtorch.so ${_TORCH_LIB_DIR}/libtorch_cpu.so ${_TORCH_LIB_DIR}/libtorch_cuda.so)
+set(FLASHMLA_V41_TORCH_PYTHON_LIBRARY ${_TORCH_LIB_DIR}/libtorch_python.so)
 set(FLASHMLA_V41_PYTHON_INCLUDE_DIRS ${Python3_INCLUDE_DIRS})
 execute_process(
     COMMAND ${Python3_EXECUTABLE} -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"

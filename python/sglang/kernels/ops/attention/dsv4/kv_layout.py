@@ -1,10 +1,16 @@
 """Paged fp8 / fp4 KV cache layouts of the DeepSeek-V4 family sparse MLA decode kernels.
 
-A page block stores ``page_size`` data rows followed by ``page_size`` scale rows.
+V41 and V41_FP4 are token-interleaved (deepseek-ai/FlashMLA@2e5429f, read by
+:mod:`sglang.kernels.ops.attention.dsv4.flashmla_v41`): each token is its data
+followed by its scales, ``bytes_per_token`` bytes, and a page is exactly
+``page_size * bytes_per_token`` bytes. V4 is page-split: a page block stores
+``page_size`` data rows followed by ``page_size`` scale rows, padded to the
+reader's TMA row stride.
+
 The reader selects the format from the bytes per token (the last dim of the
 ``(num_pages, page_size, 1, bytes_per_token)`` view) and requires the page
-stride to be a multiple of its TMA row stride, which :meth:`KVLayout.page_bytes`
-pads to. Mirrors ``sgl_kernel/deepseek_v4/kv_layout.cuh``.
+stride to be a multiple of :attr:`KVLayout.page_align`, which
+:meth:`KVLayout.page_bytes` pads to. Mirrors ``sgl_kernel/deepseek_v4/kv_layout.cuh``.
 """
 
 from __future__ import annotations
@@ -56,12 +62,18 @@ class KVLayout(str, enum.Enum):
         return self.data_bytes + self.scale_bytes
 
     @property
+    def interleaved(self) -> bool:
+        """Whether each token's scales follow its data (V41, V41_FP4) instead of a
+        page's scale rows following all of its data rows (V4)."""
+        return self in (KVLayout.V41, KVLayout.V41_FP4)
+
+    @property
     def page_align(self) -> int:
         """Unit the page stride is padded to: the reader's TMA row stride."""
         return {
             KVLayout.V4: 576,
-            KVLayout.V41: 512,
-            KVLayout.V41_FP4: 256,
+            KVLayout.V41: 528,
+            KVLayout.V41_FP4: 288,
             KVLayout.UNIFORM_FP8: 512,
         }[self]
 
@@ -74,8 +86,21 @@ class KVLayout(str, enum.Enum):
         return -(-raw // self.page_align) * self.page_align
 
     def scale_offset(self, page_size: int) -> int:
-        """Byte offset of the scale rows inside a page."""
+        """Byte offset of the scale rows inside a page (page-split layouts only)."""
+        assert not self.interleaved, f"{self} has no page scale region"
         return page_size * self.data_bytes
+
+    def token_data_offset(self, slot, page_size: int):
+        """Byte offset of token ``slot``'s data inside its page (int or tensor)."""
+        if self.interleaved:
+            return slot * self.bytes_per_token
+        return slot * self.data_bytes
+
+    def token_scale_offset(self, slot, page_size: int):
+        """Byte offset of token ``slot``'s scales inside its page (int or tensor)."""
+        if self.interleaved:
+            return slot * self.bytes_per_token + self.data_bytes
+        return page_size * self.data_bytes + slot * self.scale_bytes
 
     @property
     def cpp_name(self) -> str:

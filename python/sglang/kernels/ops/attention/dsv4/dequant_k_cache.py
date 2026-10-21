@@ -157,7 +157,6 @@ def dequantize_k_cache_paged_v41(
         DATA_BYTES=layout.data_bytes,
         SCALE_BYTES=layout.scale_bytes,
         TILE_SIZE=layout.tile_size,
-        S_OFFSET_BYTES=layout.scale_offset(page_size),
         IS_HIP=is_hip_runtime(),
     )
     return out
@@ -329,18 +328,18 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     DATA_BYTES: tl.constexpr,
     SCALE_BYTES: tl.constexpr,
     TILE_SIZE: tl.constexpr,
-    S_OFFSET_BYTES: tl.constexpr,
     IS_HIP: tl.constexpr,
 ):
-    # V41: 512 e4m3 values per token, then 16 ue8m0 scales (one per 32 values).
+    # V41: 512 e4m3 values per token, then its 16 ue8m0 scales (one per 32 values).
     tl.static_assert(DATA_BYTES == 512 and SCALE_BYTES == 16 and TILE_SIZE == 32)
     token_id = tl.program_id(0).to(tl.int64)
     loc = tl.load(page_table_ptr + token_id).to(tl.int64)
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
-    token_data_base = page_byte_base + in_page * DATA_BYTES
-    token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
+    # Token-interleaved: the token's data, then its scales.
+    token_data_base = page_byte_base + in_page * (DATA_BYTES + SCALE_BYTES)
+    token_scale_base = token_data_base + DATA_BYTES
 
     offs = tl.arange(0, DATA_BYTES)
     vals = tl.load(buf_fp8_ptr + token_data_base + offs).to(tl.float32)
@@ -364,19 +363,19 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     DATA_BYTES: tl.constexpr,
     SCALE_BYTES: tl.constexpr,
     TILE_SIZE: tl.constexpr,
-    S_OFFSET_BYTES: tl.constexpr,
     IS_HIP: tl.constexpr,
 ):
     # V41_FP4: 512 e2m1 codes packed two per byte (even index in the low nibble),
-    # then 32 e4m3 scales (one per 16 values).
+    # then the token's 32 e4m3 scales (one per 16 values).
     tl.static_assert(DATA_BYTES == 256 and SCALE_BYTES == 32 and TILE_SIZE == 16)
     token_id = tl.program_id(0).to(tl.int64)
     loc = tl.load(page_table_ptr + token_id).to(tl.int64)
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
-    token_data_base = page_byte_base + in_page * DATA_BYTES
-    token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
+    # Token-interleaved: the token's data, then its scales.
+    token_data_base = page_byte_base + in_page * (DATA_BYTES + SCALE_BYTES)
+    token_scale_base = token_data_base + DATA_BYTES
 
     boffs = tl.arange(0, DATA_BYTES)
     packed = tl.load(buf_uint8_ptr + token_data_base + boffs)

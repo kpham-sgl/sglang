@@ -3,8 +3,10 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from sgl_kernel.flash_mla_mega import flash_mla_mega_decode
 
+from sglang.kernels.ops.attention.dsv4.flashmla_v41 import (
+    mega_decode as flash_mla_mega_decode,
+)
 from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
     interleave_output_columns,
     interleave_query_rows,
