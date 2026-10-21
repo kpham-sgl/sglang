@@ -1732,6 +1732,10 @@ class Envs:
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(False)
     SGLANG_OPT_DSV41_MXFP8_AUTOTUNE_MIN_TOKENS = EnvInt(4096)
+    # DeepSeek-V4.1 Mega attention: Mega-mHC writes wqkv_a's MXFP8 input and the wo_a
+    # einsum writes wo_b's, both in DeepGEMM's packed scale layout; those two linears
+    # then run on DeepGEMM instead of FlashInfer plus a standalone quantize.
+    SGLANG_OPT_DSV41_FUSED_MXFP8_PRODUCERS = EnvBool(False)
     SGLANG_OPT_LM_HEAD_FP32_LOGITS_BUFFER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)

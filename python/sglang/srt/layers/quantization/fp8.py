@@ -61,6 +61,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     can_auto_enable_marlin_fp8,
     can_serve_block_fp8_as_mxfp8,
     cutlass_fp8_supported,
+    deepgemm_mxfp8_prequantized_linear,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     dense_mxscale_wanted,
     dispatch_block_fp8_mxfp8_linear,
@@ -78,7 +79,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
-from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8DeepGemmInput,
+    Mxfp8SwizzledInput,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -1272,6 +1276,10 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if _is_hip and self.block_fp8_as_mxfp8 and self.mxfp8_dense_backend.is_gfx95():
             return fp8_hip.apply_dense(self, layer, x, bias)
+
+        if isinstance(x, Mxfp8DeepGemmInput):
+            # Prepared by prepare_deepgemm_mxfp8_input_path beside the layer's own backend.
+            return deepgemm_mxfp8_prequantized_linear(layer, x, bias)
 
         mxfp8_view = self.use_mxfp8 or (
             self.block_fp8_as_mxfp8 and layer.block_fp8_mxfp8_ready
