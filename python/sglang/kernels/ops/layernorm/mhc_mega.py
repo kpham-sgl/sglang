@@ -27,6 +27,7 @@ def mhc_mega_boundary(
     norm_eps,
     sinkhorn_iters,
     emit_mxfp8: bool = False,
+    moe_input=None,
 ):
     """Update the residual, collapse with carried pre, and compute next stats.
 
@@ -38,6 +39,10 @@ def mhc_mega_boundary(
     With ``emit_mxfp8`` the kernel also writes the normalized rows as E4M3 with
     per-32 UE8M0 scales, packed four per int32 in DeepGEMM's MN-major TMA-aligned
     layout, returned as a fourth element ``(fp8, scales)``.
+
+    ``moe_input = (fp8, routed_sf, shared_sf, shared_sf_block_m)`` instead writes
+    the FP8 rows and their scales into MegaMoE's input buffer views (row-major
+    routed scales, BLOCK_M-paged shared-expert scales); nothing extra is returned.
     """
     rows, hidden = x.shape
     hc = residual.shape[1]
@@ -46,7 +51,11 @@ def mhc_mega_boundary(
     next_pre = torch.empty((rows, hc, 1), device=x.device, dtype=torch.float32)
     next_post = torch.empty_like(next_pre)
     next_comb = torch.empty_like(comb)
-    y_fp8 = y_gemm_sf = None
+    y_fp8 = y_gemm_sf = y_routed_sf = y_shared_sf = None
+    shared_sf_block_m = 0
+    if moe_input is not None:
+        assert not emit_mxfp8
+        y_fp8, y_routed_sf, y_shared_sf, shared_sf_block_m = moe_input
     if emit_mxfp8:
         y_fp8 = torch.empty((rows, hidden), device=x.device, dtype=torch.float8_e4m3fn)
         rows_aligned = (rows + 3) // 4 * 4
@@ -78,6 +87,9 @@ def mhc_mega_boundary(
         y_bf16=normalized,
         y_fp8=y_fp8,
         y_gemm_sf=y_gemm_sf,
+        y_routed_sf=y_routed_sf,
+        y_shared_sf=y_shared_sf,
+        shared_sf_block_m=shared_sf_block_m,
     )
     stats = (next_pre.squeeze(-1), next_post.squeeze(-1), next_comb)
     if emit_mxfp8:

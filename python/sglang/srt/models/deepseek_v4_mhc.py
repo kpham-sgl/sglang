@@ -212,6 +212,8 @@ class HcNextBoundary(NamedTuple):
     hc: Optional[HcSubLayer] = None
     # The sublayer also takes an `Mxfp8DeepGemmInput` (implies accepts_mxfp8).
     accepts_mxfp8_deepgemm: bool = False
+    # The next sublayer is this MegaMoE block: Mega-mHC may write its FP8 input.
+    mega_moe: Optional[Any] = None
 
 
 def is_deferred_finalize(routed) -> bool:
@@ -229,12 +231,21 @@ def accepts_mxfp8_deepgemm_input(attn) -> bool:
     return bool(method is not None and method())
 
 
+def mega_moe_of(layer) -> Optional[Any]:
+    """The layer's MoE block when Mega-mHC may write its MegaMoE input."""
+    if not envs.SGLANG_OPT_DSV41_MEGA_MHC_MOE_INPUT.get():
+        return None
+    mlp = getattr(layer, "mlp", None)
+    return mlp if hasattr(mlp, "mega_shared_l1_weights") else None
+
+
 def make_boundary(
     norm: RMSNorm,
     *,
     accepts_mxfp8: bool,
     hc: Optional[HcSubLayer] = None,
     accepts_mxfp8_deepgemm: bool = False,
+    mega_moe: Optional[Any] = None,
 ) -> HcNextBoundary:
     """Can this hyper-connection's norm fold into the previous post, and does its
     sublayer take a pre-quantized input."""
@@ -251,6 +262,7 @@ def make_boundary(
         ),
         hc=hc,
         accepts_mxfp8_deepgemm=accepts_mxfp8 and accepts_mxfp8_deepgemm,
+        mega_moe=mega_moe,
     )
 
 
@@ -646,6 +658,11 @@ def _post_fusion(
             and not get_forward().is_extend_in_batch
             and not get_forward().sp_active
         )
+        moe_target = None
+        if next.mega_moe is not None and not emit_mxfp8:
+            from sglang.srt.layers.moe.mega_moe import mega_moe_input_target
+
+            moe_target = mega_moe_input_target(next.mega_moe, y.shape[0])
         out = mhc_mega_boundary(
             y,
             residual,
@@ -661,6 +678,7 @@ def _post_fusion(
             next_hc.norm.variance_epsilon,
             next_hc.cfg.sinkhorn_iters,
             emit_mxfp8=emit_mxfp8,
+            moe_input=None if moe_target is None else moe_target[1],
         )
         if emit_mxfp8:
             updated, normalized, stats, (y_fp8, y_sf) = out
@@ -671,6 +689,10 @@ def _post_fusion(
                 stats,
             )
         updated, normalized, stats = out
+        if moe_target is not None:
+            from sglang.srt.layers.moe.mega_moe import MEGA_MOE_INPUT_TAG
+
+            setattr(normalized, MEGA_MOE_INPUT_TAG, moe_target[0])
         return HcState(updated, pre, HcNormed(normalized), stats)
     if (
         next is not None

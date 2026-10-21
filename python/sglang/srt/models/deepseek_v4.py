@@ -1402,7 +1402,10 @@ class MQALayer(MqaAttentionBase):
         # and the wo_a einsum wo_b's, both for DeepGEMM; the quant method gives these
         # linears the DeepGEMM scale beside FlashInfer's when it processes them.
         self._fused_mxfp8 = None
-        if self.use_mega_attention and envs.SGLANG_OPT_DSV41_FUSED_MXFP8_PRODUCERS.get():
+        if (
+            self.use_mega_attention
+            and envs.SGLANG_OPT_DSV41_FUSED_MXFP8_PRODUCERS.get()
+        ):
             self.wo_b.prepare_deepgemm_mxfp8_input = True
             if self.fuse_wqa_wkv:
                 self.wqkv_a.prepare_deepgemm_mxfp8_input = True
@@ -1484,8 +1487,7 @@ class MQALayer(MqaAttentionBase):
             wo_b = bool(
                 self.mega_wo_a is not None
                 and hasattr(self.wo_b, "weight_scale_inv_deepgemm_input")
-                and self.n_local_groups * self.o_lora_rank
-                == self.wo_b.weight.shape[-1]
+                and self.n_local_groups * self.o_lora_rank == self.wo_b.weight.shape[-1]
             )
             self._fused_mxfp8 = (wqkv_a, wo_b)
             if self.layer_id == 0 and (
@@ -4309,10 +4311,13 @@ class DeepseekV4Model(nn.Module):
             return self._forward_impl(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        from sglang.srt.layers.moe.mega_moe import mega_gate_forward_scope
+
         try:
-            return self._forward_impl(
-                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
-            )
+            with mega_gate_forward_scope(forward_batch):
+                return self._forward_impl(
+                    input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+                )
         finally:
             residual_batch.clear(forward_batch)
 

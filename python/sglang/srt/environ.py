@@ -1737,6 +1737,13 @@ class Envs:
     # einsum writes wo_b's, both in DeepGEMM's packed scale layout; those two linears
     # then run on DeepGEMM instead of FlashInfer plus a standalone quantize.
     SGLANG_OPT_DSV41_FUSED_MXFP8_PRODUCERS = EnvBool(False)
+    # DeepSeek-V4.1 MegaMoE decode/verify: DeepGEMM's bf16_mega_gate runs the gate
+    # GEMM and the sqrtsoftplus top-k in one kernel and writes MegaMoE's routing
+    # buffer; the pre-dispatch then only quantizes the input.
+    SGLANG_OPT_DSV41_MEGA_GATE = EnvBool(False)
+    # With the above: Mega-mHC also writes the MoE input's FP8 rows and scales
+    # straight into MegaMoE's buffer, so no pre-dispatch runs at all.
+    SGLANG_OPT_DSV41_MEGA_MHC_MOE_INPUT = EnvBool(False)
     SGLANG_OPT_LM_HEAD_FP32_LOGITS_BUFFER = EnvBool(False)
     SGLANG_OPT_DSV41_QNORM_MXFP8_MAX_ROWS = EnvInt(8)
     SGLANG_OPT_DSV41_INDEX_WEIGHTS_BF16 = EnvBool(False)

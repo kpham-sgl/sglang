@@ -45,6 +45,13 @@ if TYPE_CHECKING:
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _is_hip = is_hip()
 
+# Row cap for the fused gate and the Mega-mHC MoE input (decode and verify).
+MEGA_GATE_MAX_ROWS = 2048
+# Per-forward cache of the gate's row masks, installed by mega_gate_forward_scope.
+_ROW_MASKS_ATTR = "_mega_gate_row_masks"
+# Set on Mega-mHC's bf16 rows when it also wrote them into MegaMoE's buffer.
+MEGA_MOE_INPUT_TAG = "_mega_moe_input_in_buffer"
+
 
 def _use_amd_flydsl_mega_moe() -> bool:
     # aiter MegaMoEv2 exists only on ROCm; the platform check keeps the env from
@@ -250,6 +257,243 @@ def forward_mega_moe(
     return y
 
 
+@contextmanager
+def mega_gate_forward_scope(forward_batch):
+    """One model forward: the gate's row masks are built once and shared by its
+    MoE layers. Each forward (eager, warmup or graph capture) builds its own."""
+    if forward_batch is None or not envs.SGLANG_OPT_DSV41_MEGA_GATE.get():
+        yield
+        return
+    try:
+        setattr(forward_batch, _ROW_MASKS_ATTR, {})
+    except (AttributeError, TypeError):
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            delattr(forward_batch, _ROW_MASKS_ATTR)
+        except AttributeError:
+            pass
+
+
+def _mega_gate_static_ok(moe) -> bool:
+    """Layer-level conditions under which bf16_mega_gate reproduces moe.topk."""
+    from sglang.srt.layers.moe.topk import _use_aiter
+
+    config = getattr(getattr(moe, "topk", None), "topk_config", None)
+    gate = getattr(moe, "gate", None)
+    weight = getattr(gate, "weight", None)
+    bias = getattr(gate, "e_score_correction_bias", None)
+    bias_vl = getattr(gate, "e_score_correction_bias_vl", None)
+    if config is None or weight is None or bias is None:
+        return False
+    num_experts, hidden = weight.shape
+    return bool(
+        _device_sm // 10 == 10
+        and not _use_aiter
+        and not getattr(moe, "is_hash", False)
+        and moe.num_fused_shared_experts == 0
+        and config.num_shared_topk_slots == 0
+        and config.top_k == moe.config.num_experts_per_tok
+        and not config.use_grouped_topk
+        and config.custom_routing_function is None
+        and config.renormalize
+        and config.scoring_func == "sqrtsoftplus"
+        and config.sqrtsoftplus_log1p
+        and weight.dtype == torch.bfloat16
+        and weight.is_contiguous()
+        and hidden % 256 == 0
+        and num_experts % 4 == 0
+        and num_experts <= 512
+        and config.top_k <= 32
+        and bias.dtype == torch.float32
+        and bias.shape == (num_experts,)
+        and (bias_vl is None or bias_vl.dtype == torch.float32)
+        and _mega_moe_mma_type(moe.experts) == "fp8xfp4"
+    )
+
+
+def _mega_gate_rows_ok(moe, num_tokens: int) -> bool:
+    if not envs.SGLANG_OPT_DSV41_MEGA_GATE.get():
+        return False
+    static_ok = getattr(moe, "_mega_gate_ok", None)
+    if static_ok is None:
+        static_ok = _mega_gate_static_ok(moe)
+        moe._mega_gate_ok = static_ok
+    if not static_ok:
+        return False
+    from sglang.srt.runtime_context import get_forward
+
+    return (
+        0 < num_tokens <= MEGA_GATE_MAX_ROWS
+        and not get_forward().is_extend_in_batch
+        and not get_forward().sp_active
+    )
+
+
+def use_mega_gate(moe, hidden_states: torch.Tensor) -> bool:
+    return (
+        _mega_gate_rows_ok(moe, hidden_states.shape[0])
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.is_contiguous()
+    )
+
+
+def mega_moe_input_target(moe, num_tokens: int):
+    """Where Mega-mHC can write this MoE's FP8 input: ``(tag, (fp8, routed_sf,
+    shared_sf, shared_sf_block_m))``, or None. The MoE skips its pre-dispatch only
+    when its rows carry ``tag`` (the fused gate path)."""
+    if not (
+        envs.SGLANG_OPT_DSV41_MEGA_MHC_MOE_INPUT.get()
+        and _mega_gate_rows_ok(moe, num_tokens)
+        and get_moe_a2a_backend().is_megamoe()
+        and is_mega_moe_experts_ready(moe.experts)
+        and moe.mega_shared_l1_weights is not None
+    ):
+        return None
+    import deep_gemm
+
+    kwargs = _mega_routed_kwargs(moe)
+    buf = mega_moe_buffer(
+        moe.experts,
+        top_k=kwargs["top_k"],
+        hidden_size=kwargs["hidden_size"],
+        intermediate_size=kwargs["intermediate_size"],
+        num_shared_experts=kwargs["num_shared_experts"],
+    )
+    x = buf.x[:num_tokens]
+    if x.dtype != torch.float8_e4m3fn:
+        x = x.view(torch.float8_e4m3fn)
+    routed_sf = buf.x_sf[:num_tokens]
+    if not routed_sf.is_contiguous():
+        return None
+    block_m = deep_gemm.get_block_m_for_mega_moe(
+        num_ranks=buf.group.size(),
+        num_experts=buf.num_experts,
+        num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
+        num_tokens=num_tokens,
+        num_topk=buf.num_topk,
+        mma_type=buf.mma_type,
+    )
+    shared_sf = buf.shared_l1_acts_sf[:num_tokens]
+    return (buf, num_tokens), (x, routed_sf, shared_sf, block_m)
+
+
+def _gate_row_masks(moe, num_tokens, bound, input_ids, forward_batch):
+    """(valid-row mask, image-token mask) for the gate, built once per forward."""
+    gate = moe.gate
+    use_image = gate.e_score_correction_bias_vl is not None and input_ids is not None
+    cache = getattr(forward_batch, _ROW_MASKS_ATTR, None)
+    key = (
+        num_tokens,
+        id(bound) if bound is not None else None,
+        id(input_ids) if use_image else None,
+        moe.config.image_token_id if use_image else None,
+    )
+    if isinstance(cache, dict):
+        hit = cache.get(key)
+        # The cached inputs are held, so their ids cannot be reused this forward.
+        if (
+            hit is not None
+            and hit[0] is bound
+            and hit[1] is (input_ids if use_image else None)
+        ):
+            return hit[2], hit[3]
+    valid = None
+    if bound is not None:
+        valid = (
+            torch.arange(num_tokens, device=moe.gate.weight.device, dtype=torch.int32)
+            < bound.reshape(-1)[:1]
+        )
+    image = None
+    if use_image:
+        image = (input_ids[:num_tokens] == moe.config.image_token_id).contiguous()
+    if isinstance(cache, dict):
+        cache[key] = (bound, input_ids if use_image else None, valid, image)
+    return valid, image
+
+
+def _run_mega_gate(
+    moe,
+    hidden_states: torch.Tensor,
+    forward_batch,
+    input_ids_global: Optional[torch.Tensor],
+    buf,
+) -> Optional[float]:
+    """Route into MegaMoE's buffer with DeepGEMM's fused gate. Returns the routed
+    scale the experts must still apply, or None when this call cannot take it
+    (EPLB dispatch, routed-expert capture, distribution recording)."""
+    import deep_gemm
+
+    from sglang.srt.eplb.expert_distribution import (
+        ExpertDistributionRecorder,
+        get_global_expert_distribution_recorder,
+    )
+    from sglang.srt.layers.moe.topk import (
+        apply_routing_simulation,
+        get_global_experts_capturer,
+        routing_simulation_enabled,
+    )
+    from sglang.srt.runtime_context import get_parallel
+
+    config = moe.topk.topk_config
+    bound, dispatch_info = moe.topk.routing_inputs()
+    recorder = get_global_expert_distribution_recorder()
+    if (
+        dispatch_info is not None
+        or (
+            config.allow_routed_experts_capture
+            and get_global_experts_capturer() is not None
+        )
+        or type(recorder).on_select_experts
+        is not ExpertDistributionRecorder.on_select_experts
+    ):
+        return None
+    num_tokens = hidden_states.shape[0]
+    valid, image = _gate_row_masks(
+        moe, num_tokens, bound, input_ids_global, forward_batch
+    )
+    gate = moe.gate
+    routed_scaling_factor = float(moe.routed_scaling_factor)
+    topk_idx = buf.topk_idx[:num_tokens]
+    topk_weights = buf.topk_weights[:num_tokens]
+    deep_gemm.bf16_mega_gate(
+        hidden_states,
+        gate.weight,
+        config.top_k,
+        False,
+        0,
+        routed_scaling_factor,
+        get_parallel().moe_ep_rank,
+        "sqrtsoftplus",
+        mask=valid,
+        bias=gate.e_score_correction_bias,
+        image_bias=gate.e_score_correction_bias_vl if image is not None else None,
+        image_token_mask=image,
+        out=(topk_idx, topk_weights),
+    )
+    if routing_simulation_enabled():
+        # Benchmark-only override, as the unfused router applies it: uniform
+        # weights, scaled the way the unfused experts would scale them.
+        apply_routing_simulation(
+            topk_idx,
+            topk_weights,
+            gate.weight.shape[0],
+            num_routed_topk=config.top_k,
+            top_k=config.top_k,
+            layer_id=moe.layer_id,
+            num_token_non_padded=bound,
+            weight_scale=(
+                1.0
+                if moe.routed_scaling_factor_fused_in_topk
+                else routed_scaling_factor
+            ),
+        )
+    return 1.0
+
+
 def _run_mega_routed(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
@@ -258,6 +502,13 @@ def _run_mega_routed(
     num_tokens: int,
 ) -> torch.Tensor:
     hidden_size = moe.config.hidden_size
+
+    if use_mega_gate(moe, hidden_states):
+        y = _run_mega_routed_with_gate(
+            moe, hidden_states, forward_batch, input_ids_global, num_tokens
+        )
+        if y is not None:
+            return y
 
     if num_tokens > 0:
         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
@@ -306,6 +557,67 @@ def _run_mega_routed(
     )
 
 
+def _mega_routed_kwargs(moe) -> dict:
+    return dict(
+        hidden_size=moe.config.hidden_size,
+        intermediate_size=moe.config.moe_intermediate_size,
+        top_k=moe.config.num_experts_per_tok + moe.num_fused_shared_experts,
+        activation_clamp=moe.experts.moe_runner_config.swiglu_limit,
+        num_shared_experts=(
+            0 if moe.mega_shared_l1_weights is None else moe.n_shared_experts
+        ),
+        shared_l1_weights=moe.mega_shared_l1_weights,
+        shared_l2_weights=moe.mega_shared_l2_weights,
+    )
+
+
+def mega_moe_buffer(
+    experts, *, top_k, hidden_size, intermediate_size, num_shared_experts
+):
+    from sglang.srt.runtime_context import get_parallel
+
+    return _get_mega_moe_symm_buffer(
+        get_parallel().moe_ep_group.device_group,
+        num_experts=experts.num_experts,
+        num_max_tokens_per_rank=(
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        ),
+        num_topk=top_k,
+        hidden=hidden_size,
+        intermediate_hidden=intermediate_size,
+        num_shared_experts=num_shared_experts,
+        mma_type=_mega_moe_mma_type(experts),
+    )
+
+
+def _run_mega_routed_with_gate(
+    moe, hidden_states, forward_batch, input_ids_global, num_tokens
+) -> Optional[torch.Tensor]:
+    kwargs = _mega_routed_kwargs(moe)
+    buf = mega_moe_buffer(
+        moe.experts,
+        top_k=kwargs["top_k"],
+        hidden_size=kwargs["hidden_size"],
+        intermediate_size=kwargs["intermediate_size"],
+        num_shared_experts=kwargs["num_shared_experts"],
+    )
+    routed_scaling_factor = _run_mega_gate(
+        moe, hidden_states, forward_batch, input_ids_global, buf
+    )
+    if routed_scaling_factor is None:
+        return None
+    return run_mega_routed_experts(
+        moe.experts,
+        hidden_states,
+        None,
+        None,
+        num_tokens=num_tokens,
+        routed_scaling_factor=routed_scaling_factor,
+        routing_in_buffer=True,
+        **kwargs,
+    )
+
+
 def run_mega_routed_experts(
     experts,
     hidden_states: torch.Tensor,
@@ -321,8 +633,11 @@ def run_mega_routed_experts(
     num_shared_experts: int = 0,
     shared_l1_weights=None,
     shared_l2_weights=None,
+    routing_in_buffer: bool = False,
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
+    # routing_in_buffer: the fused gate already wrote buf.topk_idx / topk_weights
+    # for these rows (fp8xfp4 on SM100 only); topk_ids / topk_weights are unused.
     import deep_gemm
 
     from sglang.srt.runtime_context import get_parallel
@@ -351,7 +666,10 @@ def run_mega_routed_experts(
         mma_type=mma_type,
     )
 
-    if num_tokens > 0:
+    if routing_in_buffer:
+        assert num_tokens > 0 and _device_sm != 90 and mma_type == "fp8xfp4"
+        topk_ids_in = topk_weights_in = None
+    elif num_tokens > 0:
         topk_ids_in = topk_ids.to(torch.int32)
         topk_weights_in = topk_weights.to(torch.float32)
     else:
@@ -372,6 +690,7 @@ def run_mega_routed_experts(
         )
 
     if routed_scaling_factor != 1.0:
+        assert not routing_in_buffer
         topk_weights_in = topk_weights_in * routed_scaling_factor
 
     mega_kwargs = {"recipe": (1, 1, 32)}
@@ -427,20 +746,25 @@ def run_mega_routed_experts(
                 num_topk=buf.num_topk,
                 mma_type=buf.mma_type,
             )
-        mega_moe_pre_dispatch(
-            hidden_states,
-            topk_ids_in,
-            topk_weights_in,
-            buf.x,
-            buf.x_sf,
-            buf.topk_idx,
-            buf.topk_weights,
-            quant_group_size=32,
-            shared_x_sf=(
-                buf.shared_l1_acts_sf if shared_l1_weights is not None else None
-            ),
-            shared_block_m=shared_block_m,
-        )
+        if not (
+            routing_in_buffer
+            and getattr(hidden_states, MEGA_MOE_INPUT_TAG, None) == (buf, num_tokens)
+        ):
+            mega_moe_pre_dispatch(
+                hidden_states,
+                buf.topk_idx if routing_in_buffer else topk_ids_in,
+                buf.topk_weights if routing_in_buffer else topk_weights_in,
+                buf.x,
+                buf.x_sf,
+                buf.topk_idx,
+                buf.topk_weights,
+                quant_group_size=32,
+                shared_x_sf=(
+                    buf.shared_l1_acts_sf if shared_l1_weights is not None else None
+                ),
+                shared_block_m=shared_block_m,
+                copy_topk=not routing_in_buffer,
+            )
 
     # Allocate at least one row so y has a non-null CUDA data_ptr;
     # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
