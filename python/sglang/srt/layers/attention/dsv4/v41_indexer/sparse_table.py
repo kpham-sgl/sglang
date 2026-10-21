@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
+
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     amax8_varlen,
     amax_topk_blocks,
@@ -55,6 +57,14 @@ from .types import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+
+def _full_scan_weights(weights: torch.Tensor) -> torch.Tensor:
+    # DeepGEMM picks the reduce dtype from the weights; bf16 weights (exact here)
+    # select the bf16 reduce DeepInfer uses.
+    if envs.SGLANG_OPT_DSV41_INDEX_WEIGHTS_BF16.get():
+        return weights.to(torch.bfloat16)
+    return weights
 
 
 class _SparseTable(CandidateMetadata, msgspec.Struct):
@@ -271,7 +281,7 @@ class SparseTableBackend:
         logits = deep_gemm_fp4_paged_mqa_logits(
             q,
             data.k_cache,
-            data.weights,
+            _full_scan_weights(data.weights),
             lens,
             table,
             metadata.deep_gemm_metadata,
@@ -349,7 +359,7 @@ class SparseTableBackend:
             logits = deep_gemm_fp4_paged_mqa_logits(
                 q,
                 data.k_cache,
-                data.weights[rows],
+                _full_scan_weights(data.weights[rows]),
                 lens,
                 table,
                 plan,

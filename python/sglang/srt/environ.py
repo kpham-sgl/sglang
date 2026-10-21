@@ -1734,6 +1734,7 @@ class Envs:
     SGLANG_OPT_DSV41_MXFP8_AUTOTUNE_MIN_TOKENS = EnvInt(4096)
     SGLANG_OPT_LM_HEAD_FP32_LOGITS_BUFFER = EnvBool(False)
     SGLANG_OPT_DSV41_QNORM_MXFP8_MAX_ROWS = EnvInt(8)
+    SGLANG_OPT_DSV41_INDEX_WEIGHTS_BF16 = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
