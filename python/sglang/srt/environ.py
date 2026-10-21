@@ -1710,6 +1710,11 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+    # Keep each rank's engram row shard in exportable device memory (CUDA VMM,
+    # FABRIC handles across an NVLink domain) mapped by every rank of the TP group:
+    # a rank reads its own tokens' rows from the owning shard, with no id gather
+    # and no reduce-scatter. Takes precedence over the host table.
+    SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
