@@ -1559,6 +1559,7 @@ class MQALayer(MqaAttentionBase):
             allow_mxfp8_output
             and 0 < rows <= mhc.FUSED_MXFP8_PRODUCER_MAX_ROWS
             and self._fused_mxfp8_producers()[1]
+            and not get_forward().is_extend_in_batch
             and not get_forward().sp_active
         ):
             import deep_gemm
