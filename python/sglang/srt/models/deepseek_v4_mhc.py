@@ -50,8 +50,8 @@ _is_xpu = is_xpu()
 
 # The fused all-reduce epilogues have world-size-templated kernels for TP2 and TP4.
 _FUSED_MHC_TP_SIZES = (2, 4)
-# Row cap for the producers that emit DeepGEMM-layout MXFP8 (decode and verify
-# batches); larger prefill chunks keep the FlashInfer quantize + GEMM.
+# Row cap for the producers that emit DeepGEMM-layout MXFP8. They run in decode and
+# verify only; prefill keeps the FlashInfer quantize + GEMM.
 FUSED_MXFP8_PRODUCER_MAX_ROWS = 2048
 
 
@@ -643,6 +643,7 @@ def _post_fusion(
         emit_mxfp8 = (
             next.accepts_mxfp8_deepgemm
             and y.shape[0] <= FUSED_MXFP8_PRODUCER_MAX_ROWS
+            and not get_forward().is_extend_in_batch
             and not get_forward().sp_active
         )
         out = mhc_mega_boundary(
