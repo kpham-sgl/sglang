@@ -6,7 +6,7 @@
 #
 # Inputs: FLASHMLA_V41_SOURCE_DIR (a FlashMLA 2e5429f checkout with csrc/3rdparty/cutlass populated;
 # fetched when unset), FLASHMLA_V41_TORCH_INCLUDE_DIRS / FLASHMLA_V41_TORCH_LIBRARIES (default: the
-# Torch package's), FLASHMLA_V41_PYTHON_INCLUDE_DIRS.
+# Torch package's), FLASHMLA_V41_TORCH_PYTHON_LIBRARY, FLASHMLA_V41_PYTHON_INCLUDE_DIRS.
 
 if(NOT FLASHMLA_V41_SOURCE_DIR)
     FetchContent_Declare(
@@ -80,6 +80,11 @@ endif()
 if(NOT FLASHMLA_V41_TORCH_LIBRARIES)
     set(FLASHMLA_V41_TORCH_LIBRARIES ${TORCH_LIBRARIES})
 endif()
+# FlashMLA's api/*.cpp also define its pybind registrations (unused here), whose tensor casters live in
+# libtorch_python.
+if(NOT FLASHMLA_V41_TORCH_PYTHON_LIBRARY)
+    find_library(FLASHMLA_V41_TORCH_PYTHON_LIBRARY torch_python HINTS ${TORCH_INSTALL_PREFIX}/lib)
+endif()
 if(NOT FLASHMLA_V41_PYTHON_INCLUDE_DIRS)
     set(FLASHMLA_V41_PYTHON_INCLUDE_DIRS ${Python_INCLUDE_DIRS})
 endif()
@@ -90,6 +95,8 @@ set_target_properties(flashmla_v41_ops PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     CUDA_VISIBILITY_PRESET hidden
     CUDA_SEPARABLE_COMPILATION OFF
+    # The -gencode flags above choose the targets.
+    CUDA_ARCHITECTURES OFF
 )
 target_compile_options(flashmla_v41_ops PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-std=c++20 -O3 -Wno-deprecated-declarations>
@@ -107,10 +114,11 @@ target_include_directories(flashmla_v41_ops PRIVATE
     ${_FMLA41}/3rdparty/cutlass/tools/util/include
     ${_FMLA41}/3rdparty/kerutils/include
     ${FLASHMLA_V41_CCCL_INCLUDE}
+    ${CUDAToolkit_INCLUDE_DIRS}
     ${FLASHMLA_V41_TORCH_INCLUDE_DIRS}
     ${FLASHMLA_V41_PYTHON_INCLUDE_DIRS}
 )
 # -Bsymbolic: the FlashMLA template instantiations share mangled names with flashmla_ops' (both use
 # a `ModelType` enum, with different values), so every reference must bind inside this library.
 target_link_options(flashmla_v41_ops PRIVATE "-Wl,-Bsymbolic" "-Wl,--exclude-libs,ALL")
-target_link_libraries(flashmla_v41_ops PRIVATE ${FLASHMLA_V41_TORCH_LIBRARIES} cuda)
+target_link_libraries(flashmla_v41_ops PRIVATE ${FLASHMLA_V41_TORCH_LIBRARIES} ${FLASHMLA_V41_TORCH_PYTHON_LIBRARY} cuda)
