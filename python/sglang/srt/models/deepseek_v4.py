@@ -1530,7 +1530,9 @@ class MQALayer(MqaAttentionBase):
             o = q.new_empty((q.shape[0], self.n_local_groups, self.o_lora_rank))
             bcg_deepseek_v4_mega_attention_with_output(self, q, o, attn_sink)
             return o
-        return self._mega_core(q, attn_sink, forward_batch, attn_backend)
+        return self._mega_core(
+            q, attn_sink, forward_batch, attn_backend, allow_mxfp8_output=True
+        )
 
     def _mega_core(
         self,
@@ -1538,7 +1540,8 @@ class MQALayer(MqaAttentionBase):
         attn_sink: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend,
-    ) -> torch.Tensor:
+        allow_mxfp8_output: bool = False,
+    ) -> torch.Tensor | Mxfp8DeepGemmInput:
         data, scale = attn_backend.forward(
             q=q,
             k=q,
@@ -1553,7 +1556,8 @@ class MQALayer(MqaAttentionBase):
         groups = self.n_local_groups
         rows = data.shape[0]
         if (
-            0 < rows <= mhc.FUSED_MXFP8_PRODUCER_MAX_ROWS
+            allow_mxfp8_output
+            and 0 < rows <= mhc.FUSED_MXFP8_PRODUCER_MAX_ROWS
             and self._fused_mxfp8_producers()[1]
             and not get_forward().sp_active
         ):
