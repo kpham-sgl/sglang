@@ -5,10 +5,15 @@ Each DP rank warms a long shared prefix; every request adds a random, uncached
 --tokens-per-step new tokens per rank per step; decode streams --batch-per-rank
 requests per rank and times --measure-steps steps.
 
-Throughput counts whole steps only: the window starts and ends at step boundaries
-(the scheduler's stamps under --enable-metrics, else response arrival gaps).
---server-log cross-checks the engine's per-step log lines over the same window; it
-needs the server on this host's clock, with SGLANG_LOG_MS=1. In HTTP mode the
+Throughput counts whole steps only: the window starts and ends at step boundaries.
+Under --enable-metrics the server stamps each response with the scheduler's step end
+(prefill: `prefill_finished_time`; decode: `decode_step_finished_time` on every
+streamed chunk), and the stamps are the steps; without them the steps are inferred
+from response arrival gaps, which at wide DP blur once the chunks of a step no
+longer arrive before the next step's. --server-log reads the engine's per-step log
+lines over the same window: a cross-check when the stamps are there, the decode
+number itself when they are not (the arrival window then only bounds it). It needs
+the server on this host's clock, with SGLANG_LOG_MS=1. In HTTP mode the
 package, GPU and environment fields describe the benchmark client; server_info
 records the server.
 
@@ -77,19 +82,25 @@ def group_window(groups, lo, hi):
     return ends[i][0], ends[j][0], ends[j][1] - ends[i][1], gaps
 
 
-def log_steps(lines, mode, t0, t1, size, tol=None):
-    """Per rank, the engine's ms per step over [t0, t1] (epoch seconds). With `tol`, t0
-    and t1 are scheduler step ends: each rank logs a line within `tol` of every step end,
-    so the lines from the one at t0 to the one at t1 are the window's steps. Otherwise
-    the lines whose interval since the rank's previous line lies inside the window, at
-    batch `size`."""
+def log_steps(lines, mode, t0, t1, size, tol=None, windows=None):
+    """Per rank, the engine's ms per step over [t0, t1] (epoch seconds), or over the
+    rank's own window from `windows` (rank -> (t0, t1), scheduler stamps on that rank's
+    clock). With `tol`, t0 and t1 are scheduler step ends: each rank logs a line within
+    `tol` of every step end, so the lines from the one at t0 to the one at t1 are the
+    window's steps. Otherwise the lines whose interval since the rank's previous line
+    lies inside the window, at batch `size`."""
     per_rank, spans, prev, accept, seen = {}, {}, {}, [], set()
-    edges = {}
+    edges, length = {}, {}
     for m in filter(None, map(LINES[mode].search, lines)):
         ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
         ts, step = ts + float(m.group(2) or 0), 0.001 if m.group(2) else 1.0
         rank = int(m.group(3) or 0)
         start, prev[rank] = prev.get(rank, 0.0), ts
+        if windows is not None:
+            if rank not in windows:
+                continue
+            t0, t1 = windows[rank]
+        length[rank] = t1 - t0
         if tol is not None:
             if m.group(2) and t0 - tol < ts <= t1 + tol:
                 edges.setdefault(rank, []).append(ts)
@@ -122,7 +133,9 @@ def log_steps(lines, mode, t0, t1, size, tol=None):
     check = {
         "ms_per_step_per_rank": {r: statistics.mean(v) for r, v in per_rank.items()}
     }
-    check["coverage"] = min(((b - a) / (t1 - t0) for a, b in spans.values()), default=0)
+    check["coverage"] = min(
+        ((b - a) / length[r] for r, (a, b) in spans.items()), default=0
+    )
     check["complete"] = check["coverage"] >= 0.8
     check["sizes_seen"] = sorted(seen)
     if accept:
@@ -156,6 +169,30 @@ def check_cache(meta, new_tokens):
             "the shared prefix was evicted/missed or part of a suffix was cached"
         )
     return new
+
+
+def promote_log(check, res, size, dp, num_gpus):
+    """Without scheduler stamps the engine's lines are the only step evidence: when
+    they cover the window on every rank at the fixed batch, they become the decode
+    number and the arrival-timed window drops to a cross-check. Returns whether."""
+    per_rank = check.get("ms_per_step_per_rank") or {}
+    if (
+        set(per_rank) != set(range(dp))
+        or not check.get("complete")
+        or check.get("sizes_seen") != [size]
+    ):
+        return False
+    ms = statistics.mean(per_rank.values())
+    check["arrival_ms_per_step"] = res["ms_per_step"]
+    check["arrival_diff_pct"] = (res["ms_per_step"] / ms - 1) * 100
+    accept = check.get("accept_len", res["accept_len"])
+    res.update(
+        ms_per_step=ms,
+        accept_len=accept,
+        tok_s_per_gpu=size * dp * accept / ms * 1000 / num_gpus,
+        stamp="engine log",
+    )
+    return True
 
 
 def check_logs(check, result, size, dp, blurred):
@@ -394,7 +431,16 @@ async def prefill(args, tp, prompt):
 
 
 async def decode(args, tp, prompt):
+    """Steps come from the scheduler's own stamps when the chunks carry them
+    (`decode_step_finished_time`, exported under --enable-metrics): every chunk a step
+    produced carries that step's end time, so the stamps of one rank are its steps,
+    exactly, however late the chunks arrive. Each rank's window is its own run of
+    stamps, so clock offsets between nodes do not matter. Without stamps the steps
+    are inferred from arrival gaps, which only works while every chunk of a step
+    arrives before the next step's."""
     n, events, first = args.batch_per_rank, [], set()
+    stamps = [{} for _ in range(args.dp)]  # per rank: step end -> tokens delivered
+    full = [None] * args.dp  # per rank: the step end at which its batch became full
     params = {"max_new_tokens": args.output_len, "temperature": 0.0, "ignore_eos": True}
 
     async def one(r, k):
@@ -405,10 +451,18 @@ async def decode(args, tp, prompt):
             count = meta["completion_tokens"]
             if count < seen:
                 raise RuntimeError("stream completion_tokens decreased")
+            first.add((r, k))
+            stamp = meta.get("decode_step_finished_time")
             if count > seen:
                 events.append((t, count - seen))
+                if stamp is not None:
+                    stamps[r][stamp] = stamps[r].get(stamp, 0) + count - seen
             seen = count
-            first.add((r, k))
+            if stamp is not None and full[r] is None and started_on(r) == n:
+                full[r] = stamp
+
+    def started_on(r):
+        return sum(1 for rank, _ in first if rank == r)
 
     async def wait(cond, why):
         deadline, shown = time.time() + args.timeout, time.time()
@@ -424,7 +478,7 @@ async def decode(args, tp, prompt):
             await asyncio.sleep(0.1)
 
     def started():
-        per_rank = [sum(1 for rank, _ in first if rank == r) for r in range(args.dp)]
+        per_rank = [started_on(r) for r in range(args.dp)]
         return (
             f"requests started per rank {per_rank} of {n}; the server may admit "
             "fewer (see --max-running-requests over the DP size)"
@@ -433,14 +487,26 @@ async def decode(args, tp, prompt):
     def steps_after(t_all):
         return len(step_groups([e[0] for e in events if e[0] > t_all], n * args.dp))
 
+    def rank_steps(r):  # the rank's step ends after its batch filled, in order
+        return sorted(s for s in stamps[r] if full[r] is not None and s > full[r])
+
+    need = args.warmup_steps + args.measure_steps + 2
     tasks = [asyncio.ensure_future(one(r, k)) for r in range(args.dp) for k in range(n)]
     try:
         await wait(lambda: len(first) == n * args.dp, started)  # the full batch runs
-        t_all, need = time.time(), args.warmup_steps + args.measure_steps + 2
-        await wait(
-            lambda: steps_after(t_all) >= need,
-            lambda: f"{steps_after(t_all)} of {need} steps",
-        )
+        t_all = time.time()
+        stamped = any(stamps)
+        if stamped:
+            await wait(
+                lambda: all(len(rank_steps(r)) >= need for r in range(args.dp)),
+                lambda: f"{min(len(rank_steps(r)) for r in range(args.dp))} of "
+                f"{need} stamped steps on the slowest rank",
+            )
+        else:
+            await wait(
+                lambda: steps_after(t_all) >= need,
+                lambda: f"{steps_after(t_all)} of {need} steps",
+            )
         if args.profile_steps:
             await tp.start_profile(args.profile)
             await asyncio.sleep(2 + args.profile_steps * 0.1)
@@ -448,6 +514,24 @@ async def decode(args, tp, prompt):
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+    if stamped:
+        windows, spans, tokens, group_ms = {}, [], 0, []
+        for r in range(args.dp):
+            w = rank_steps(r)[args.warmup_steps :][: args.measure_steps + 1]
+            windows[r] = (w[0], w[-1])
+            spans.append(w[-1] - w[0])
+            tokens += sum(stamps[r][s] for s in w[1:])
+            group_ms += [(b - a) * 1000 for a, b in zip(w, w[1:])]
+        return dict(
+            steps=args.measure_steps,
+            seconds=statistics.mean(spans),
+            tokens=tokens,
+            wall=(min(a for a, _ in windows.values()), max(b for _, b in windows.values())),
+            windows=windows,
+            group_ms=group_ms,
+            size=n,
+            stamp="scheduler",
+        )
     groups = step_groups([e[0] for e in events if e[0] > t_all], n * args.dp)
     window = [end for end, _ in groups[args.warmup_steps :][: args.measure_steps + 1]]
     t0, t1 = window[0], window[-1]
@@ -603,7 +687,7 @@ def run_benchmark(args, tp):
             sample_output.seek(0)
             sample_text = sample_output.read()
             sample_output.close()
-    size = res.pop("size")
+    size, windows = res.pop("size"), res.pop("windows", None)
     steps, span, tokens = res["steps"], res["seconds"], res["tokens"]
     res.update(
         ms_per_step=span / steps * 1000, tok_s_per_gpu=tokens / span / args.num_gpus
@@ -621,14 +705,19 @@ def run_benchmark(args, tp):
         for key, col in zip(("sm_clock_mhz", "power_w"), zip(*in_window)):
             res[key + "_median"] = statistics.median(float(x) for x in col)
     lines = [line for path in args.server_log for line in open(path, errors="replace")]
-    tol = min(res["group_ms"]) / 4000 if res["stamp"] == "scheduler" else None
+    prefill_stamps = args.mode == "prefill" and res["stamp"] == "scheduler"
+    tol = min(res["group_ms"]) / 4000 if prefill_stamps else None
     median = statistics.median(res["group_ms"])
-    blurred = args.mode == "decode" and any(
+    blurred = res["stamp"] == "arrival" and any(
         not 0.6 * median <= ms <= 1.6 * median for ms in res["group_ms"]
     )
     check = {}
     if args.server_log:
-        check = log_steps(lines, args.mode, *res["wall"], size, tol)
+        check = log_steps(lines, args.mode, *res["wall"], size, tol, windows)
+        if res["stamp"] == "arrival" and promote_log(
+            check, res, size, args.dp, args.num_gpus
+        ):
+            blurred = False  # the arrival gaps no longer carry the number
         check = check_logs(check, res, size, args.dp, blurred)
     record = dict(
         mode=args.mode,
@@ -641,12 +730,18 @@ def run_benchmark(args, tp):
         server_info=info,
         **environment(),
     )
+    source = {"scheduler": "scheduler stamps", "arrival": "arrival times"}
     print(
         f"{args.mode}: {res['ms_per_step']:.2f} ms/step, "
         f"{res['tok_s_per_gpu']:.0f} tok/s/GPU over {steps:.2f} whole steps "
-        f"({res['stamp']} times)"
+        f"({source.get(res['stamp'], res['stamp'])})"
     )
-    if "ms_per_step" in check:
+    if "arrival_ms_per_step" in check:
+        print(
+            f"arrival times: {check['arrival_ms_per_step']:.2f} ms/step, "
+            f"{check['arrival_diff_pct']:+.2f}% (not the number: no stamps)"
+        )
+    elif "ms_per_step" in check:
         print(
             f"engine log: {check['ms_per_step']:.2f} ms/step, {check['diff_pct']:+.2f}%"
         )

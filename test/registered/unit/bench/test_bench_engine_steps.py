@@ -258,6 +258,82 @@ class TestWorkloadGuards(unittest.TestCase):
         self.assertEqual(record["workload"]["num_gpus"], 4)
         self.assertAlmostEqual(record["result"]["tok_s_per_gpu"], 5)
 
+    def test_decode_steps_from_scheduler_stamps(self):
+        # Two ranks, two requests each, 10 ms steps stamped by the scheduler; rank 1's
+        # clock runs 1,000 s ahead and its chunks arrive late and jumbled, which must
+        # not matter: each rank's window is its own run of stamps.
+        class Transport:
+            async def generate(self, ids, params, rank, stream):
+                offset = 1000.0 if rank else 0.0
+                for count in range(1, 10000):
+                    stamp = 5000.0 + offset + 0.01 * count
+                    meta = dict(
+                        prompt_tokens=8,
+                        cached_tokens=7,
+                        completion_tokens=count,
+                        decode_step_finished_time=stamp,
+                    )
+                    await asyncio.sleep(0.0005 * (1 + rank))
+                    yield time.time(), meta
+
+        args = SimpleNamespace(
+            dp=2,
+            batch_per_rank=2,
+            new_tokens=1,
+            output_len=10000,
+            timeout=5,
+            warmup_steps=3,
+            measure_steps=5,
+            profile_steps=0,
+        )
+        result = asyncio.run(bench.decode(args, Transport(), lambda rank: []))
+        self.assertEqual(result["stamp"], "scheduler")
+        self.assertAlmostEqual(result["seconds"] / result["steps"], 0.01)
+        self.assertEqual(result["tokens"], 5 * 2 * 2)  # 5 steps x 2 requests x 2 ranks
+        self.assertEqual(set(result["windows"]), {0, 1})
+        self.assertAlmostEqual(result["windows"][1][0] - result["windows"][0][0], 1000)
+        self.assertTrue(all(abs(ms - 10) < 1e-6 for ms in result["group_ms"]))
+
+    def test_engine_log_becomes_the_number_without_stamps(self):
+        res = dict(ms_per_step=54.0, accept_len=1.2, tok_s_per_gpu=1.0)
+        check = dict(
+            ms_per_step_per_rank={0: 11.0, 1: 11.4},
+            complete=True,
+            sizes_seen=[32],
+            accept_len=3.25,
+        )
+        self.assertTrue(bench.promote_log(check, res, 32, 2, 2))
+        self.assertAlmostEqual(res["ms_per_step"], 11.2)
+        self.assertEqual(res["stamp"], "engine log")
+        self.assertAlmostEqual(res["tok_s_per_gpu"], 32 * 2 * 3.25 / 11.2 * 1000 / 2)
+        self.assertAlmostEqual(check["arrival_ms_per_step"], 54.0)
+        self.assertFalse(bench.check_logs(check, res, 32, 2, False)["errors"])
+        for bad in (
+            dict(check, ms_per_step_per_rank={0: 11.0}),
+            dict(check, complete=False),
+            dict(check, sizes_seen=[31, 32]),
+        ):
+            self.assertFalse(bench.promote_log(bad, dict(res), 32, 2, 2))
+
+    def test_log_steps_per_rank_windows(self):
+        t = datetime(2026, 10, 22, 10, 0, 5).timestamp()
+        line = (
+            "[2026-10-22 10:00:{:02d}.000 DP{} TP0 EP0] Decode batch, #running-req: 8, "
+            "token usage: 0.50, accept len: 3.25, gen throughput (token/s): {}"
+        )
+        lines = [
+            line.format(5, 0, "1.00"),
+            line.format(6, 0, "2600.00"),  # 8 x 3.25 / 2600 = 10 ms
+            line.format(7, 1, "1.00"),
+            line.format(8, 1, "2000.00"),  # 13 ms, inside rank 1's own window only
+        ]
+        windows = {0: (t - 0.1, t + 1.1), 1: (t + 1.9, t + 3.1)}
+        got = bench.log_steps(lines, "decode", t, t + 1, 8, windows=windows)
+        self.assertEqual(got["ms_per_step_per_rank"], {0: 10.0, 1: 13.0})
+        self.assertTrue(got["complete"])  # each rank's interval covers 83% of its window
+        got = bench.log_steps(lines, "decode", t - 0.1, t + 1.1, 8)
+        self.assertEqual(got["ms_per_step_per_rank"], {0: 10.0})
+
     def test_decode_does_not_count_metadata_only_chunks_as_steps(self):
         class Transport:
             async def generate(self, *args):
