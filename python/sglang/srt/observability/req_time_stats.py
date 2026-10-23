@@ -684,6 +684,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
+            "last_decode_finish_time": self.last_decode_finish_time,
             # Read by meta_info["queue_time"] on the tokenizer; timestamps cannot rebuild it.
             "queue_duration_s": self.queue_duration_s,
             "storage_prefetch_wait_s": (
