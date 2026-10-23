@@ -1228,6 +1228,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             meta_data["prefill_finished_time"] = convert_time_to_realtime(
                 self.prefill_finished_time
             )
+        if self.last_decode_finish_time > 0.0:
+            # The end of the decode step that produced this chunk, on the
+            # scheduler's clock: chunks with the same stamp came from one step.
+            meta_data["decode_step_finished_time"] = convert_time_to_realtime(
+                self.last_decode_finish_time
+            )
         meta_data.update(
             {
                 "queue_time": self.get_queueing_time(),
