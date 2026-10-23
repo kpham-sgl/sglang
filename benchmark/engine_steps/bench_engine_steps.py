@@ -13,7 +13,9 @@ from response arrival gaps, which at wide DP blur once the chunks of a step no
 longer arrive before the next step's. --server-log reads the engine's per-step log
 lines over the same window: a cross-check when the stamps are there, the decode
 number itself when they are not (the arrival window then only bounds it). It needs
-the server on this host's clock, with SGLANG_LOG_MS=1. In HTTP mode the
+the server on this host's clock, with SGLANG_LOG_MS=1. Decode needs the server's
+--stream-interval 1 and --incremental-streaming-output, so each step sends one small
+chunk per request. In HTTP mode the
 package, GPU and environment fields describe the benchmark client; server_info
 records the server.
 
@@ -651,6 +653,10 @@ def run_benchmark(args, tp):
         raise SystemExit("EPLB is on: rebalance steps would land in the window")
     if args.mode == "decode" and info.get("stream_interval", 1) != 1:
         raise SystemExit("decode needs --stream-interval 1: one streamed chunk a step")
+    if args.mode == "decode" and not info.get("incremental_streaming_output"):
+        # Otherwise every chunk carries the whole output so far (text and ids), so
+        # the bytes a step sends grow with the output and the streams fall behind.
+        raise SystemExit("decode needs --incremental-streaming-output: delta chunks")
     # A warm cache (an earlier run with the same seed) would serve the suffixes
     if not args.no_flush and (err := tp.flush_cache()):
         raise SystemExit(f"flushing the server's cache failed: {err}")

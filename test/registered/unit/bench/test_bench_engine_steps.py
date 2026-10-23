@@ -258,6 +258,18 @@ class TestWorkloadGuards(unittest.TestCase):
         self.assertEqual(record["workload"]["num_gpus"], 4)
         self.assertAlmostEqual(record["result"]["tok_s_per_gpu"], 5)
 
+    def test_decode_requires_delta_chunks(self):
+        transport = Mock()
+        transport.server_info.return_value = dict(
+            tp_size=1, dp_size=1, stream_interval=1, incremental_streaming_output=False
+        )
+        args = SimpleNamespace(
+            mode="decode", dp=1, num_gpus=None, new_tokens=1, context=2, seed=0,
+            no_flush=True, engine=False, sample_gpu=False, server_log=[],
+        )
+        with self.assertRaisesRegex(SystemExit, "incremental-streaming-output"):
+            bench.run_benchmark(args, transport)
+
     def test_decode_steps_from_scheduler_stamps(self):
         # Two ranks, two requests each, 10 ms steps stamped by the scheduler; rank 1's
         # clock runs 1,000 s ahead and its chunks arrive late and jumbled, which must
