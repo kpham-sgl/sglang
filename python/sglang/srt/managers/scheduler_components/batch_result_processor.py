@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -995,6 +996,9 @@ class SchedulerBatchResultProcessor:
         if batch.spec_algorithm.is_none() and logits_output is not None:
             newly_finished_beam_groups = self.beam_coordinator.commit_decode(batch)
 
+        # One end time for the step: every request of the batch gets the same
+        # stamp, so a client can group their chunks by the step that produced them.
+        step_end = time.perf_counter()
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -1005,7 +1009,7 @@ class SchedulerBatchResultProcessor:
                     id(req.beam_group) not in newly_finished_beam_groups
                 ):
                     continue
-                req.time_stats.set_last_decode_finish_time()
+                req.time_stats.set_last_decode_finish_time(step_end)
                 self._handle_finish_state_updated_req(
                     req, batch, result, i, logits_output
                 )
@@ -1023,7 +1027,7 @@ class SchedulerBatchResultProcessor:
             next_token_id = next_token_ids[i]
             is_spec = not batch.spec_algorithm.is_none()
 
-            req.time_stats.set_last_decode_finish_time()
+            req.time_stats.set_last_decode_finish_time(step_end)
             sampling_mask_finish_reason = None
             if req.return_sampling_mask:
                 statuses = logits_output.next_token_sampling_mask_status
